@@ -1,0 +1,12 @@
+# Smoke-test config for the runtime image: an empty catalog with the plugins loaded
+authentication:
+  allow_anonymous_access: true
+trees:
+  - path: /
+    tree: catalog
+    args:
+      uri: "sqlite:////tmp/catalog.db"
+      writable_storage: "/tmp/data"
+      init_if_not_exists: true
+routers:
+  - dls_tiled.visr:visr_router
