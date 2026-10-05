@@ -40,6 +40,18 @@ routers:
 
 Ported from Hiran Wijesinghe's [visr-tiled](https://github.com/hyperrealist/visr-tiled).
 
+## Logging
+
+tiled's default logging config has no handler for the plugin loggers, so their
+INFO messages are dropped. The image includes `/deploy/log_config.yml`, which is
+tiled's default plus the `dls_tiled` loggers. Select it by overriding the
+container command, e.g. with the tiled helm chart:
+
+```yaml
+args: [tiled, serve, config, --host, 0.0.0.0, --port, "8000", --scalable,
+       --log-config, /deploy/log_config.yml]
+```
+
 ## Tiled version
 
 `TILED_VERSION` at the top of the `Dockerfile` selects the upstream release.
