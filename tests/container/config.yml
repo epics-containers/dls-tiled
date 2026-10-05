@@ -1,6 +1,7 @@
 # Smoke-test config for the runtime image: an empty catalog with the plugins loaded
 authentication:
   allow_anonymous_access: true
+  single_user_api_key: smoke-test
 trees:
   - path: /
     tree: catalog
