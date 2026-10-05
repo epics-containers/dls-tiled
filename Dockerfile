@@ -28,6 +28,10 @@ RUN --mount=from=ghcr.io/astral-sh/uv:0.10,source=/uv,target=/bin/uv \
     && chown -R app:app /app
 USER app
 
+# Logging config that also shows the plugin loggers: use with
+# tiled serve config ... --log-config /deploy/log_config.yml
+COPY log_config.yml /deploy/log_config.yml
+
 # Check the plugins import and that upstream tiled was left at its release
 RUN python -c "import dls_tiled.visr, tiled; \
 assert tiled.__version__ == '${TILED_VERSION}', tiled.__version__"
