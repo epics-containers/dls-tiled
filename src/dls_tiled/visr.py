@@ -15,7 +15,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Security
 from h5py._hl.dataset import Dataset as H5Dataset
 from scanspec.core import stack2dimension
 from scanspec.specs import Spec
-from starlette.status import HTTP_422_UNPROCESSABLE_CONTENT
+from starlette.status import (
+    HTTP_422_UNPROCESSABLE_CONTENT,
+    HTTP_503_SERVICE_UNAVAILABLE,
+)
+from tiled.adapters.utils import DataNotReadyError
 from tiled.server.authentication import (  # type: ignore
     check_scopes,
     get_current_access_tags,
@@ -34,6 +38,11 @@ CROSS_CHANNEL_RETRIES = int(os.getenv("DLS_TILED_VISR_CROSS_CHANNEL_RETRIES", "5
 CROSS_CHANNEL_RETRY_DELAY = float(
     os.getenv("DLS_TILED_VISR_CROSS_CHANNEL_RETRY_DELAY", "0.1")
 )
+# Tiled raises DataNotReadyError when the file on disk has fewer frames than the
+# catalog advertises, i.e. a live write hasn't landed yet. It is retryable.
+NOT_READY_RETRIES = int(os.getenv("DLS_TILED_VISR_NOT_READY_RETRIES", "3"))
+NOT_READY_RETRY_DELAY = float(os.getenv("DLS_TILED_VISR_NOT_READY_RETRY_DELAY", "0.2"))
+RETRY_AFTER_SECONDS = 1
 
 
 class ScanType(enum.Enum):
@@ -59,15 +68,30 @@ async def get_data(root, segments) -> H5Dataset | numpy.ndarray | dict:
         except Exception:
             raise
     else:
-        # Leaf node — read it
-        try:
-            if inspect.iscoroutinefunction(adapter.read):
-                data = await adapter.read()
-            else:
-                data = await anyio.to_thread.run_sync(adapter.read)
-            return data
-        except Exception:
-            raise
+        # Leaf node - read it. A file that is still behind the catalog is retried
+        # briefly, then reported as 503 with Retry-After (as Tiled's own routes
+        # do) rather than as an error the client can't tell from a bad request.
+        for attempt in range(NOT_READY_RETRIES + 1):
+            try:
+                if inspect.iscoroutinefunction(adapter.read):
+                    return await adapter.read()
+                return await anyio.to_thread.run_sync(adapter.read)
+            except DataNotReadyError as err:
+                if attempt == NOT_READY_RETRIES:
+                    raise HTTPException(
+                        status_code=HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=str(err),
+                        headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+                    ) from None
+                logger.info(
+                    "Data for %s not ready (attempt %d/%d): %s",
+                    "/".join(segments),
+                    attempt + 1,
+                    NOT_READY_RETRIES + 1,
+                    err,
+                )
+                await anyio.sleep(NOT_READY_RETRY_DELAY)
+        raise AssertionError("unreachable")  # pragma: no cover
 
 
 async def fill_data(root, segments, shape=None, fill_value=numpy.nan):
@@ -186,6 +210,8 @@ async def get_readbacks(root, uid, readback_x):
     """
     try:
         readback_x, scan_type = await _fetch_readback_x(root, uid)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=HTTP_422_UNPROCESSABLE_CONTENT,
@@ -328,6 +354,8 @@ async def binned(  # type: ignore
         assert isinstance(blue_total, H5Dataset) or isinstance(
             blue_total, numpy.ndarray
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=HTTP_422_UNPROCESSABLE_CONTENT,

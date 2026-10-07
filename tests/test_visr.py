@@ -3,12 +3,20 @@ from types import SimpleNamespace
 
 import numpy
 import pytest
+from fastapi import HTTPException
 from scanspec.specs import Line
+from tiled.adapters.utils import DataNotReadyError
 from tiled.catalog import in_memory
 from tiled.client import Context, from_context
 from tiled.server.app import build_app
 
-from dls_tiled.visr import compute_binned_image, get_setpoints, visr_router
+from dls_tiled import visr
+from dls_tiled.visr import (
+    compute_binned_image,
+    get_data,
+    get_setpoints,
+    visr_router,
+)
 
 
 @pytest.fixture
@@ -105,3 +113,66 @@ def test_setpoints_keep_dimension_order_when_axes_are_not_x_y_z():
 
     assert x.tolist() == [0, 0, 0, 1, 1, 1]
     assert y.tolist() == [0, 5, 10, 0, 5, 10]
+
+
+class _LaggingAdapter:
+    """A leaf whose file is behind the catalog for the first `lag` reads."""
+
+    def __init__(self, lag):
+        self.lag = lag
+        self.reads = 0
+
+    def read(self):
+        self.reads += 1
+        if self.reads <= self.lag:
+            raise DataNotReadyError("advertises (25,), only (24,) available")
+        return numpy.arange(25.0)
+
+
+def _root_with(adapter):
+    async def lookup_adapter(segments):
+        return adapter
+
+    return SimpleNamespace(lookup_adapter=lookup_adapter)
+
+
+@pytest.fixture
+def fast_retries(monkeypatch):
+    monkeypatch.setattr(visr, "NOT_READY_RETRY_DELAY", 0.0)
+
+
+def test_get_data_retries_a_file_that_is_behind_the_catalog(fast_retries):
+    adapter = _LaggingAdapter(lag=2)
+
+    data = asyncio.run(get_data(_root_with(adapter), ["uid", "primary", "RedTotal"]))
+
+    assert isinstance(data, numpy.ndarray)
+    assert data.shape == (25,)
+    assert adapter.reads == 3
+
+
+def test_get_data_answers_503_with_retry_after_when_the_file_stays_behind(fast_retries):
+    adapter = _LaggingAdapter(lag=100)
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(get_data(_root_with(adapter), ["uid", "primary", "RedTotal"]))
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.headers == {"Retry-After": "1"}
+    assert adapter.reads == visr.NOT_READY_RETRIES + 1
+
+
+def test_binned_keeps_a_503_instead_of_turning_it_into_422(client, monkeypatch):
+    write_step_scan(client)
+
+    async def not_ready(root, segments):
+        raise HTTPException(
+            status_code=503, detail="not ready", headers={"Retry-After": "1"}
+        )
+
+    monkeypatch.setattr(visr, "get_data", not_ready)
+
+    response = client.context.http_client.get("/api/v1/binned/scan")
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
