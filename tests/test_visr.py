@@ -47,10 +47,50 @@ def test_binned_step_scan(client):
 
     assert response.status_code == 200, response.text
     body = response.json()
-    # mean of the two points in each (x, y) cell
-    assert body["RedTotal"] == [[0.5, 4.5], [2.5, 6.5]]
-    assert body["GreenTotal"] == [[5.0, 45.0], [25.0, 65.0]]
+    # mean of the two points in each cell; one row per y bin, one column per x bin
+    assert body["RedTotal"] == [[0.5, 2.5], [4.5, 6.5]]
+    assert body["GreenTotal"] == [[5.0, 25.0], [45.0, 65.0]]
     assert body["x_limits"] == [0.0, 0.55, 1.1]
+    assert body["y_limits"] == [0.0, 0.55, 1.1]
+    assert body["n_points"] == 8
+
+
+def test_binned_rows_are_y_and_columns_are_x(client):
+    # x only takes two values and y four, so the image must be 4 rows by 2 columns
+    primary = client.create_container("raster").create_container("primary")
+    x = numpy.array([0.0, 1.0] * 4)
+    y = numpy.repeat([0.0, 1.0, 2.0, 3.0], 2)
+    primary.write_array(x, key="X")
+    primary.write_array(y, key="Y")
+    for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
+        primary.write_array(numpy.arange(8.0), key=channel)
+
+    response = client.context.http_client.get(
+        "/api/v1/binned/raster", params={"width": 2, "height": 4}
+    )
+
+    body = response.json()
+    assert body["RedTotal"] == [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]
+    assert len(body["x_limits"]) == 3 and len(body["y_limits"]) == 5
+
+
+def test_binned_reports_empty_bins_as_null_and_keeps_a_measured_zero(client):
+    primary = client.create_container("sparse").create_container("primary")
+    primary.write_array(numpy.array([0.0, 1.0]), key="X")
+    primary.write_array(numpy.array([0.0, 1.0]), key="Y")
+    for channel, values in (
+        ("RedTotal", [0.0, 5.0]),
+        ("GreenTotal", [1.0, 2.0]),
+        ("BlueTotal", [3.0, 4.0]),
+    ):
+        primary.write_array(numpy.array(values), key=channel)
+
+    response = client.context.http_client.get(
+        "/api/v1/binned/sparse", params={"width": 2, "height": 2}
+    )
+
+    # a measured 0.0 stays 0.0; the two cells no point landed in are null
+    assert response.json()["RedTotal"] == [[0.0, None], [None, 5.0]]
 
 
 def test_binned_missing_run_is_422(client):
@@ -69,6 +109,18 @@ def test_compute_binned_image_empty_bins_are_zero():
     )
 
     assert result["img"].tolist() == [[2.0, 0.0], [0.0, 0.0]]
+    assert result["counts"].tolist() == [[1.0, 0.0], [0.0, 0.0]]
+
+
+def test_image_rows_are_y_transposes_and_marks_empty_bins():
+    img = numpy.array([[1.0, 2.0, 0.0], [3.0, 0.0, 0.0]])  # [x_bin, y_bin]
+    counts = numpy.array([[1, 1, 0], [1, 0, 0]])
+
+    assert visr.image_rows_are_y(img, counts) == [
+        [1.0, 3.0],
+        [2.0, None],
+        [None, None],
+    ]
 
 
 def _setpoints(spec, **start):

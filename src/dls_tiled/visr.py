@@ -314,6 +314,11 @@ async def binned(  # type: ignore
 ):
     """Fetch a folded representation of an array dataset.
 
+    Returns ``RedTotal``/``GreenTotal``/``BlueTotal`` as matrices with one row per
+    y bin and one column per x bin (the layout image plots expect), ``null`` for
+    bins no point fell into, ``x_limits``/``y_limits`` as the bin edges (one more
+    than the columns/rows), and ``n_points``, the number of scan points used.
+
     Args:
         x_dim_index: Index into the position array to use as the x axis (default 0).
         y_dim_index: Index into the position array to use as the y axis (default 1).
@@ -453,6 +458,7 @@ async def binned(  # type: ignore
         "GreenTotal": green_total,
         "BlueTotal": blue_total,
     }
+    n_points = int(readbacks.shape[-1])
 
     # mask out the points that lie outside the slice
     mask = numpy.ones(readbacks.size, dtype=bool)
@@ -507,20 +513,36 @@ async def binned(  # type: ignore
     if all(opt is not None for opt in (xmin, xmax, ymin, ymax)):
         histogram2d_kwargs["range"] = ((xmin, xmax), (ymin, ymax))
 
-    binned_output = {}
+    binned_output: dict = {}
     for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
         binned_channel = compute_binned_image(
             data[channel], x_positions, y_positions, **histogram2d_kwargs
         )
-        binned_output[channel] = binned_channel["img"].tolist()
+        binned_output[channel] = image_rows_are_y(
+            binned_channel["img"], binned_channel["counts"]
+        )
     binned_output["x_limits"] = binned_channel["x"].tolist()
     binned_output["y_limits"] = binned_channel["y"].tolist()
+    binned_output["n_points"] = n_points
 
     return binned_output
+
+
+def image_rows_are_y(img, counts) -> list[list[float | None]]:
+    """The binned image as plot-ready rows: one row per y bin, one column per x
+    bin, and ``None`` (JSON ``null``) where no point landed.
+
+    ``numpy.histogram2d`` indexes its result ``[x_bin, y_bin]``, so it is
+    transposed here. An empty bin is reported as ``None`` rather than ``0`` so a
+    plot can tell "no data yet" from a measured zero.
+    """
+    rows = numpy.where(counts > 0, img, numpy.nan).T.astype(object)
+    rows[counts.T == 0] = None
+    return rows.tolist()
 
 
 def compute_binned_image(data, readback_x, readback_y, **kwargs):
     counts, edges_x, edges_y = numpy.histogram2d(readback_x, readback_y, **kwargs)
     weights, _, _ = numpy.histogram2d(readback_x, readback_y, weights=data, **kwargs)
     img = numpy.divide(weights, counts, out=numpy.zeros_like(weights), where=counts > 0)
-    return {"img": img, "x": edges_x, "y": edges_y}
+    return {"img": img, "counts": counts, "x": edges_x, "y": edges_y}
