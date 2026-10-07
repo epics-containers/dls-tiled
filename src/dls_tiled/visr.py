@@ -171,19 +171,33 @@ def _axis_letter(name: object) -> str | None:
     return letter if letter in _AXIS_LETTERS else None
 
 
+_REPR_NAME_RE = re.compile(r"""name=["']([^"']+)["']""")
+
+
+def _axis_name(axis: object) -> str | None:
+    """The device name of a spec axis, or None if the spec doesn't carry one.
+
+    A spec axis is whatever the plan passed in: a plain name, an ophyd-async
+    repr that carries the name (``Motor(name="sample_stage-x")``), or, in older
+    runs, an object repr with no name (``<... Motor object at 0x7f...>``).
+    """
+    if not isinstance(axis, str):
+        return None
+    named = _REPR_NAME_RE.search(axis)
+    if named:
+        return named.group(1)
+    return None if axis.startswith("<") else axis
+
+
 def _axis_letters(axes: list, motors: object) -> list[str | None]:
     """The x/y/z letter of each spec axis, or None where it can't be told.
 
-    Newer runs name their axes in the spec; older ones recorded an object repr,
-    so for those the run's ``motors`` list, which is in the same order as the
-    spec's axes, supplies the names.
+    The names come from the spec's axes. Where the spec has none (older runs
+    store an object repr) the run's ``motors`` list, which is in the same order
+    as the spec's axes, supplies them.
     """
-    names = list(axes)
-    if (
-        any(isinstance(n, str) and n.startswith("<") for n in names)
-        and isinstance(motors, list)
-        and len(motors) == len(names)
-    ):
+    names = [_axis_name(a) for a in axes]
+    if None in names and isinstance(motors, list) and len(motors) == len(axes):
         names = list(motors)
     return [_axis_letter(n) for n in names]
 

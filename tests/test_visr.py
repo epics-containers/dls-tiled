@@ -479,3 +479,43 @@ def test_binned_etag_changes_when_the_image_does(client):
     assert short != full
     stale = http.get("/api/v1/binned/full", headers={"If-None-Match": short})
     assert stale.status_code == 200
+
+
+# --- the axis forms real runs store ---
+
+
+@pytest.mark.parametrize(
+    ("stored", "name"),
+    [
+        ("sample_stage-x", "sample_stage-x"),
+        ('Motor(name="sample_stage-x")', "sample_stage-x"),
+        ("Motor(name='sample_stage-y')", "sample_stage-y"),
+        ("<ophyd_async.epics.motor.Motor object at 0x7f797c058590>", None),
+    ],
+)
+def test_axis_name_reads_the_name_out_of_the_forms_runs_store(stored, name):
+    assert visr._axis_name(stored) == name
+
+
+def test_setpoints_of_runs_with_named_reprs_need_no_motors_list():
+    # recent runs store Motor(name=...) and fly scans have no motors list
+    spec = Line('Motor(name="sample_stage-y")', 0, 1, 2) * Line(
+        'Motor(name="sample_stage-x")', 0, 10, 3
+    )
+
+    x, y, _ = _setpoints(spec)
+
+    assert x.tolist() == [0, 5, 10, 0, 5, 10]
+    assert y.tolist() == [0, 0, 0, 1, 1, 1]
+
+
+def test_grid_of_runs_with_named_reprs_needs_no_motors_list():
+    spec = Line('Motor(name="sample_stage-y")', 0, 2, 3) * ~Line(
+        'Motor(name="sample_stage-x")', 0, 10, 3
+    )
+
+    x_edges, y_edges, n_total = _grid(spec)
+
+    assert x_edges.tolist() == [-2.5, 2.5, 7.5, 12.5]
+    assert y_edges.tolist() == [-0.5, 0.5, 1.5, 2.5]
+    assert n_total == 9
