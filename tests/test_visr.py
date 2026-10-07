@@ -337,3 +337,133 @@ def test_binned_without_a_spec_still_reports_no_total(client):
     body = client.context.http_client.get("/api/v1/binned/scan").json()
 
     assert body["n_total"] is None
+
+
+# --- sharing work between polls ------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def isolated_binned_cache(monkeypatch):
+    """Start every test with an empty cache, switched off unless the test opts in."""
+    visr._recent.clear()
+    visr._inflight.clear()
+    monkeypatch.setattr(visr, "BINNED_CACHE_SECONDS", 0.0)
+
+
+class _Counting:
+    """An async compute() that records how often it ran."""
+
+    def __init__(self, result=(b"{}", '"e"'), delay=0.05, error=None):
+        self.calls = 0
+        self.result, self.delay, self.error = result, delay, error
+
+    async def __call__(self):
+        self.calls += 1
+        await asyncio.sleep(self.delay)
+        if self.error:
+            raise self.error
+        return self.result
+
+
+def test_concurrent_identical_requests_share_one_computation(monkeypatch):
+    monkeypatch.setattr(visr, "BINNED_CACHE_SECONDS", 0.5)
+    compute = _Counting()
+
+    async def scenario():
+        return await asyncio.gather(
+            *(visr._shared(("uid", ()), compute) for _ in range(8))
+        )
+
+    results = asyncio.run(scenario())
+
+    assert compute.calls == 1
+    assert results == [compute.result] * 8
+
+
+def test_a_result_is_reused_for_a_moment_and_then_recomputed(monkeypatch):
+    monkeypatch.setattr(visr, "BINNED_CACHE_SECONDS", 0.1)
+    compute = _Counting(delay=0)
+
+    async def scenario():
+        await visr._shared(("uid", ()), compute)
+        await visr._shared(("uid", ()), compute)
+        assert compute.calls == 1
+        await asyncio.sleep(0.12)
+        await visr._shared(("uid", ()), compute)
+
+    asyncio.run(scenario())
+
+    assert compute.calls == 2
+
+
+def test_different_requests_do_not_share(monkeypatch):
+    monkeypatch.setattr(visr, "BINNED_CACHE_SECONDS", 0.5)
+    compute = _Counting(delay=0)
+
+    async def scenario():
+        await visr._shared(("a", ()), compute)
+        await visr._shared(("b", ()), compute)
+        await visr._shared(("a", (("width", "3"),)), compute)
+
+    asyncio.run(scenario())
+
+    assert compute.calls == 3
+
+
+def test_errors_reach_everyone_waiting_but_are_not_kept(monkeypatch):
+    monkeypatch.setattr(visr, "BINNED_CACHE_SECONDS", 0.5)
+    failing = _Counting(error=HTTPException(status_code=503, detail="not ready"))
+    working = _Counting(delay=0)
+
+    async def scenario():
+        outcomes = await asyncio.gather(
+            *(visr._shared(("uid", ()), failing) for _ in range(3)),
+            return_exceptions=True,
+        )
+        assert all(
+            isinstance(o, HTTPException) and o.status_code == 503 for o in outcomes
+        )
+        return await visr._shared(("uid", ()), working)  # the error wasn't cached
+
+    assert asyncio.run(scenario()) == working.result
+    assert failing.calls == 1 and working.calls == 1
+
+
+def test_a_cache_time_of_zero_turns_sharing_off():
+    compute = _Counting(delay=0)
+
+    async def scenario():
+        await visr._shared(("uid", ()), compute)
+        await visr._shared(("uid", ()), compute)
+
+    asyncio.run(scenario())
+
+    assert compute.calls == 2
+
+
+def test_binned_has_an_etag_and_answers_304_when_nothing_changed(client, monkeypatch):
+    monkeypatch.setattr(visr, "BINNED_CACHE_SECONDS", 0.5)
+    write_grid_scan(client, "grid", 6)
+    http = client.context.http_client
+
+    first = http.get("/api/v1/binned/grid")
+    second = http.get(
+        "/api/v1/binned/grid", headers={"If-None-Match": first.headers["etag"]}
+    )
+
+    assert first.status_code == 200 and first.headers["cache-control"] == "no-cache"
+    assert second.status_code == 304 and second.content == b""
+    assert second.headers["etag"] == first.headers["etag"]
+
+
+def test_binned_etag_changes_when_the_image_does(client):
+    write_grid_scan(client, "short", 4)
+    write_grid_scan(client, "full", 6)
+    http = client.context.http_client
+
+    short = http.get("/api/v1/binned/short").headers["etag"]
+    full = http.get("/api/v1/binned/full").headers["etag"]
+
+    assert short != full
+    stale = http.get("/api/v1/binned/full", headers={"If-None-Match": short})
+    assert stale.status_code == 200

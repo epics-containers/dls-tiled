@@ -3,17 +3,28 @@
 Enable it in the tiled config with ``routers: [dls_tiled.visr:visr_router]``.
 """
 
+import asyncio
 import enum
 import functools
+import hashlib
 import inspect
 import json
 import logging
 import os
 import re
+import time
 
 import anyio.to_thread
 import numpy
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Security
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    Security,
+)
 from h5py._hl.dataset import Dataset as H5Dataset
 from scanspec.core import stack2dimension
 from scanspec.specs import Spec
@@ -53,6 +64,45 @@ class ScanType(enum.Enum):
 
 
 visr_router = APIRouter()
+
+
+BINNED_CACHE_SECONDS = float(os.getenv("DLS_TILED_VISR_CACHE_SECONDS", "0.5"))
+_recent: dict[tuple, tuple[float, tuple[bytes, str]]] = {}
+_inflight: dict[tuple, asyncio.Future] = {}
+
+
+async def _shared(key: tuple, compute):
+    """Await ``compute()`` once for concurrent callers with the same key, and reuse
+    its result for ``BINNED_CACHE_SECONDS``. Errors are shared with the callers
+    waiting on that call but never kept. A cache time of 0 turns this off."""
+    if BINNED_CACHE_SECONDS <= 0:
+        return await compute()
+    now = time.monotonic()
+    hit = _recent.get(key)
+    if hit is not None and now - hit[0] < BINNED_CACHE_SECONDS:
+        return hit[1]
+    pending = _inflight.get(key)
+    if pending is not None:
+        return await asyncio.shield(pending)
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    # Mark any error as retrieved, so a call nobody else waited on doesn't warn.
+    future.add_done_callback(lambda f: f.cancelled() or f.exception())
+    _inflight[key] = future
+    try:
+        result = await compute()
+    except BaseException as error:
+        future.set_exception(error)
+        raise
+    else:
+        future.set_result(result)
+        for stale in [
+            k for k, (t, _) in _recent.items() if now - t > BINNED_CACHE_SECONDS
+        ]:
+            del _recent[stale]
+        _recent[key] = (time.monotonic(), result)
+        return result
+    finally:
+        _inflight.pop(key, None)
 
 
 async def get_data(root, segments) -> H5Dataset | numpy.ndarray | dict:
@@ -408,6 +458,51 @@ async def binned(  # type: ignore
     segments = [s for s in path.strip("/").split("/") if s]
     uid = segments[0]
 
+    # A UI polls this several times a second per client while points arrive only
+    # every couple of seconds, so identical requests share one computation (and
+    # one read of the files) and its result is reused for a moment.
+    key = (uid, tuple(sorted(request.query_params.multi_items())))
+
+    async def compute():
+        output = await _binned_output(
+            root,
+            uid,
+            x_dim_index,
+            y_dim_index,
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+            width,
+            height,
+            setpoints,
+            slice_dim,
+        )
+        payload = json.dumps(output, separators=(",", ":")).encode()
+        return payload, f'"{hashlib.sha1(payload).hexdigest()[:20]}"'
+
+    payload, etag = await _shared(key, compute)
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    if etag in request.headers.get("if-none-match", ""):
+        return Response(status_code=304, headers=headers)
+    return Response(payload, media_type="application/json", headers=headers)
+
+
+async def _binned_output(
+    root,
+    uid,
+    x_dim_index,
+    y_dim_index,
+    xmin,
+    xmax,
+    ymin,
+    ymax,
+    width,
+    height,
+    setpoints,
+    slice_dim,
+) -> dict:
+    """Compute the binned images for one run (the body of the /binned endpoint)."""
     # load data
     try:
         red_total = await get_data(root, [uid, "primary", "RedTotal"])
