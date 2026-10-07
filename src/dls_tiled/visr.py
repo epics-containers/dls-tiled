@@ -3,18 +3,36 @@
 Enable it in the tiled config with ``routers: [dls_tiled.visr:visr_router]``.
 """
 
+import asyncio
 import enum
+import functools
+import hashlib
 import inspect
+import json
 import logging
 import os
+import re
+import time
 
 import anyio.to_thread
 import numpy
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Security
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    Security,
+)
 from h5py._hl.dataset import Dataset as H5Dataset
 from scanspec.core import stack2dimension
 from scanspec.specs import Spec
-from starlette.status import HTTP_422_UNPROCESSABLE_CONTENT
+from starlette.status import (
+    HTTP_422_UNPROCESSABLE_CONTENT,
+    HTTP_503_SERVICE_UNAVAILABLE,
+)
+from tiled.adapters.utils import DataNotReadyError
 from tiled.server.authentication import (  # type: ignore
     check_scopes,
     get_current_access_tags,
@@ -33,6 +51,11 @@ CROSS_CHANNEL_RETRIES = int(os.getenv("DLS_TILED_VISR_CROSS_CHANNEL_RETRIES", "5
 CROSS_CHANNEL_RETRY_DELAY = float(
     os.getenv("DLS_TILED_VISR_CROSS_CHANNEL_RETRY_DELAY", "0.1")
 )
+# Tiled raises DataNotReadyError when the file on disk has fewer frames than the
+# catalog advertises, i.e. a live write hasn't landed yet. It is retryable.
+NOT_READY_RETRIES = int(os.getenv("DLS_TILED_VISR_NOT_READY_RETRIES", "3"))
+NOT_READY_RETRY_DELAY = float(os.getenv("DLS_TILED_VISR_NOT_READY_RETRY_DELAY", "0.2"))
+RETRY_AFTER_SECONDS = 1
 
 
 class ScanType(enum.Enum):
@@ -41,6 +64,45 @@ class ScanType(enum.Enum):
 
 
 visr_router = APIRouter()
+
+
+BINNED_CACHE_SECONDS = float(os.getenv("DLS_TILED_VISR_CACHE_SECONDS", "0.5"))
+_recent: dict[tuple, tuple[float, tuple[bytes, str]]] = {}
+_inflight: dict[tuple, asyncio.Future] = {}
+
+
+async def _shared(key: tuple, compute):
+    """Await ``compute()`` once for concurrent callers with the same key, and reuse
+    its result for ``BINNED_CACHE_SECONDS``. Errors are shared with the callers
+    waiting on that call but never kept. A cache time of 0 turns this off."""
+    if BINNED_CACHE_SECONDS <= 0:
+        return await compute()
+    now = time.monotonic()
+    hit = _recent.get(key)
+    if hit is not None and now - hit[0] < BINNED_CACHE_SECONDS:
+        return hit[1]
+    pending = _inflight.get(key)
+    if pending is not None:
+        return await asyncio.shield(pending)
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    # Mark any error as retrieved, so a call nobody else waited on doesn't warn.
+    future.add_done_callback(lambda f: f.cancelled() or f.exception())
+    _inflight[key] = future
+    try:
+        result = await compute()
+    except BaseException as error:
+        future.set_exception(error)
+        raise
+    else:
+        future.set_result(result)
+        for stale in [
+            k for k, (t, _) in _recent.items() if now - t > BINNED_CACHE_SECONDS
+        ]:
+            del _recent[stale]
+        _recent[key] = (time.monotonic(), result)
+        return result
+    finally:
+        _inflight.pop(key, None)
 
 
 async def get_data(root, segments) -> H5Dataset | numpy.ndarray | dict:
@@ -58,15 +120,30 @@ async def get_data(root, segments) -> H5Dataset | numpy.ndarray | dict:
         except Exception:
             raise
     else:
-        # Leaf node — read it
-        try:
-            if inspect.iscoroutinefunction(adapter.read):
-                data = await adapter.read()
-            else:
-                data = await anyio.to_thread.run_sync(adapter.read)
-            return data
-        except Exception:
-            raise
+        # Leaf node - read it. A file that is still behind the catalog is retried
+        # briefly, then reported as 503 with Retry-After (as Tiled's own routes
+        # do) rather than as an error the client can't tell from a bad request.
+        for attempt in range(NOT_READY_RETRIES + 1):
+            try:
+                if inspect.iscoroutinefunction(adapter.read):
+                    return await adapter.read()
+                return await anyio.to_thread.run_sync(adapter.read)
+            except DataNotReadyError as err:
+                if attempt == NOT_READY_RETRIES:
+                    raise HTTPException(
+                        status_code=HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=str(err),
+                        headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+                    ) from None
+                logger.info(
+                    "Data for %s not ready (attempt %d/%d): %s",
+                    "/".join(segments),
+                    attempt + 1,
+                    NOT_READY_RETRIES + 1,
+                    err,
+                )
+                await anyio.sleep(NOT_READY_RETRY_DELAY)
+        raise AssertionError("unreachable")  # pragma: no cover
 
 
 async def fill_data(root, segments, shape=None, fill_value=numpy.nan):
@@ -83,19 +160,170 @@ def _channel_length(array: H5Dataset | numpy.ndarray | dict) -> int:
     return array.shape[-1]
 
 
+_AXIS_LETTERS = ("x", "y", "z")
+
+
+def _axis_letter(name: object) -> str | None:
+    """Return "x", "y" or "z" if the axis name ends in one (e.g. "sample_stage-x")."""
+    if not isinstance(name, str):
+        return None
+    letter = re.split(r"[-_.]", name.lower())[-1]
+    return letter if letter in _AXIS_LETTERS else None
+
+
+_REPR_NAME_RE = re.compile(r"""name=["']([^"']+)["']""")
+
+
+def _axis_name(axis: object) -> str | None:
+    """The device name of a spec axis, or None if the spec doesn't carry one.
+
+    A spec axis is whatever the plan passed in: a plain name, an ophyd-async
+    repr that carries the name (``Motor(name="sample_stage-x")``), or, in older
+    runs, an object repr with no name (``<... Motor object at 0x7f...>``).
+    """
+    if not isinstance(axis, str):
+        return None
+    named = _REPR_NAME_RE.search(axis)
+    if named:
+        return named.group(1)
+    return None if axis.startswith("<") else axis
+
+
+def _axis_letters(axes: list, motors: object) -> list[str | None]:
+    """The x/y/z letter of each spec axis, or None where it can't be told.
+
+    The names come from the spec's axes. Where the spec has none (older runs
+    store an object repr) the run's ``motors`` list, which is in the same order
+    as the spec's axes, supplies them.
+    """
+    names = [_axis_name(a) for a in axes]
+    if None in names and isinstance(motors, list) and len(motors) == len(axes):
+        names = list(motors)
+    return [_axis_letter(n) for n in names]
+
+
+def _xyz_order(axes: list, motors: object) -> list[int]:
+    """Indices that put a spec's axes in x, y, z order.
+
+    A spec lists its axes outermost dimension first, which is not necessarily x
+    first (a raster scan has y as the outer axis). If the axes cannot be told
+    apart as x, y and z, keep the spec's own order.
+    """
+    letters = _axis_letters(axes, motors)
+    if None in letters or len(set(letters)) != len(letters):
+        return list(range(len(axes)))
+    return sorted(range(len(axes)), key=lambda i: _AXIS_LETTERS.index(letters[i]))
+
+
+def _bin_edges(centres: numpy.ndarray) -> numpy.ndarray:
+    """Edges halfway between consecutive centres, extended half a step at each end."""
+    if len(centres) == 1:
+        return numpy.array([centres[0] - 0.5, centres[0] + 0.5])
+    mids = (centres[:-1] + centres[1:]) / 2
+    first = centres[0] - (centres[1] - centres[0]) / 2
+    last = centres[-1] + (centres[-1] - centres[-2]) / 2
+    return numpy.concatenate([[first], mids, [last]])
+
+
+# Past this many cells the native-resolution image is too much to send on every
+# poll, so the caller falls back to the coarse default binning.
+MAX_GRID_CELLS = int(os.getenv("DLS_TILED_VISR_MAX_GRID_CELLS", "100000"))
+# The ViSR plot needs at least three points on each axis, so a scan narrower than
+# that keeps the previous default binning.
+MIN_CELLS_PER_AXIS = 3
+
+
+@functools.lru_cache(maxsize=32)
+def _grid_from_spec(spec_json: str, motors_json: str):
+    """Bin edges for x and y and the point count of the scan the spec describes.
+
+    The grid is the set of distinct setpoint positions on each axis, so every
+    setpoint falls in its own cell and the cells' edges lie halfway between
+    neighbours. Returns None when the spec has no x and y axes that can be
+    identified, or doesn't lay points out on a grid (a spiral, say), where the
+    caller falls back to binning the positions as they come. Cached: the spec
+    of a run never changes, and this is asked for on every poll.
+    """
+    spec = Spec.deserialize(json.loads(spec_json))
+    by_axis = stack2dimension(spec.calculate()).midpoints
+    axes = list(by_axis)
+    letters = _axis_letters(axes, json.loads(motors_json))
+    if "x" not in letters or "y" not in letters or len(set(letters)) != len(letters):
+        return None
+    n_total = len(by_axis[axes[0]])
+    xs = numpy.unique(numpy.round(by_axis[axes[letters.index("x")]], 9))
+    ys = numpy.unique(numpy.round(by_axis[axes[letters.index("y")]], 9))
+    if min(len(xs), len(ys)) < MIN_CELLS_PER_AXIS:
+        return None  # a line, or too few cells for the plot's axes
+    if len(xs) * len(ys) > min(n_total, MAX_GRID_CELLS):
+        return None  # more cells than points: not a grid
+    return _bin_edges(xs), _bin_edges(ys), n_total
+
+
+# Share of the recorded positions that must lie inside the spec's grid for the
+# grid to be used for binning them.
+MIN_POSITIONS_ON_GRID = 0.9
+
+
+def positions_fit_grid(x, y, x_edges, y_edges, uid="") -> bool:
+    """Whether the recorded positions lie on the spec's grid.
+
+    The grid is in the spec's coordinates. If the recorded positions are in
+    another frame (fly scans currently record positions offset from their
+    setpoints), binning them onto that grid would leave it empty, so the
+    caller keeps the previous binning instead.
+    """
+    x, y = numpy.asarray(x, dtype=float), numpy.asarray(y, dtype=float)
+    if x.size == 0:
+        return True  # nothing received yet: the grid is all there is to show
+    inside = (
+        (x >= x_edges[0]) & (x <= x_edges[-1]) & (y >= y_edges[0]) & (y <= y_edges[-1])
+    )
+    share = float(inside.mean())
+    if share < MIN_POSITIONS_ON_GRID:
+        logger.info(
+            "Recorded positions for '%s' lie outside the spec's grid "
+            "(%.0f%% inside x %s..%s, y %s..%s); keeping the default binning",
+            uid,
+            100 * share,
+            x_edges[0],
+            x_edges[-1],
+            y_edges[0],
+            y_edges[-1],
+        )
+        return False
+    return True
+
+
+async def get_scan_grid(root, uid):
+    """The run's setpoint grid ``(x_edges, y_edges, n_total)``, or None."""
+    try:
+        adapter = await root.lookup_adapter([uid])
+        start = adapter.metadata()["start"]
+        return _grid_from_spec(
+            json.dumps(start["spec"]), json.dumps(start.get("motors"))
+        )
+    except Exception as e:
+        logger.debug("No usable scan grid for '%s': %s", uid, e)
+        return None
+
+
 async def get_setpoints(root, uid):
     """Return setpoints from the bluesky start document stored in a node's metadata."""
     adapter = await root.lookup_adapter([uid])
     metadata = adapter.metadata()
     try:
-        spec = Spec.deserialize(metadata["start"]["spec"])
+        start = metadata["start"]
+        spec = Spec.deserialize(start["spec"])
     except KeyError as e:
         raise HTTPException(
             status_code=HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Could not find 'start.spec' in metadata for '{uid}': {e}",
         ) from None
 
-    midpoints = list(stack2dimension(spec.calculate()).midpoints.values())
+    by_axis = stack2dimension(spec.calculate()).midpoints
+    axes = list(by_axis)
+    midpoints = [by_axis[axes[i]] for i in _xyz_order(axes, start.get("motors"))]
     x = midpoints[0]
     y = midpoints[1] if len(midpoints) > 1 else numpy.full(x.shape, numpy.nan)
     z = midpoints[2] if len(midpoints) > 2 else numpy.full(x.shape, numpy.nan)
@@ -149,6 +377,8 @@ async def get_readbacks(root, uid, readback_x):
     """
     try:
         readback_x, scan_type = await _fetch_readback_x(root, uid)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=HTTP_422_UNPROCESSABLE_CONTENT,
@@ -251,6 +481,16 @@ async def binned(  # type: ignore
 ):
     """Fetch a folded representation of an array dataset.
 
+    Returns ``RedTotal``/``GreenTotal``/``BlueTotal`` as matrices with one row per
+    y bin and one column per x bin (the layout image plots expect), ``null`` for
+    bins no point fell into, ``x_limits``/``y_limits`` as the bin edges (one more
+    than the columns/rows), ``n_points``, the number of scan points used, and
+    ``n_total``, the number the scan will have (``null`` if the run has no spec).
+
+    Unless ``width``/``height`` or a full range are given, bins follow the scan's
+    setpoint grid when its spec describes one: one cell per setpoint, a range
+    fixed from the first poll.
+
     Args:
         x_dim_index: Index into the position array to use as the x axis (default 0).
         y_dim_index: Index into the position array to use as the y axis (default 1).
@@ -274,6 +514,51 @@ async def binned(  # type: ignore
     segments = [s for s in path.strip("/").split("/") if s]
     uid = segments[0]
 
+    # A UI polls this several times a second per client while points arrive only
+    # every couple of seconds, so identical requests share one computation (and
+    # one read of the files) and its result is reused for a moment.
+    key = (uid, tuple(sorted(request.query_params.multi_items())))
+
+    async def compute():
+        output = await _binned_output(
+            root,
+            uid,
+            x_dim_index,
+            y_dim_index,
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+            width,
+            height,
+            setpoints,
+            slice_dim,
+        )
+        payload = json.dumps(output, separators=(",", ":")).encode()
+        return payload, f'"{hashlib.sha1(payload).hexdigest()[:20]}"'
+
+    payload, etag = await _shared(key, compute)
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    if etag in request.headers.get("if-none-match", ""):
+        return Response(status_code=304, headers=headers)
+    return Response(payload, media_type="application/json", headers=headers)
+
+
+async def _binned_output(
+    root,
+    uid,
+    x_dim_index,
+    y_dim_index,
+    xmin,
+    xmax,
+    ymin,
+    ymax,
+    width,
+    height,
+    setpoints,
+    slice_dim,
+) -> dict:
+    """Compute the binned images for one run (the body of the /binned endpoint)."""
     # load data
     try:
         red_total = await get_data(root, [uid, "primary", "RedTotal"])
@@ -291,6 +576,8 @@ async def binned(  # type: ignore
         assert isinstance(blue_total, H5Dataset) or isinstance(
             blue_total, numpy.ndarray
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=HTTP_422_UNPROCESSABLE_CONTENT,
@@ -388,6 +675,7 @@ async def binned(  # type: ignore
         "GreenTotal": green_total,
         "BlueTotal": blue_total,
     }
+    n_points = int(readbacks.shape[-1])
 
     # mask out the points that lie outside the slice
     mask = numpy.ones(readbacks.size, dtype=bool)
@@ -436,26 +724,60 @@ async def binned(  # type: ignore
     y_positions = readbacks[y_dim_index, :]
 
     # bundle the kwargs
-    histogram2d_kwargs = {}
-    if all(opt is not None for opt in (width, height)):
+    histogram2d_kwargs: dict = {}
+    explicit_bins = all(opt is not None for opt in (width, height))
+    explicit_range = all(opt is not None for opt in (xmin, xmax, ymin, ymax))
+    if explicit_bins:
         histogram2d_kwargs["bins"] = (width, height)
-    if all(opt is not None for opt in (xmin, xmax, ymin, ymax)):
+    if explicit_range:
         histogram2d_kwargs["range"] = ((xmin, xmax), (ymin, ymax))
 
-    binned_output = {}
+    # Unless the caller chose the binning, use the scan's own setpoint grid: one
+    # cell per setpoint and a range fixed by the spec from the first poll, rather
+    # than a fixed 10x10 over whatever extent the points received so far happen
+    # to cover (which rescales the whole image as the scan fills in).
+    grid = await get_scan_grid(root, uid)
+    n_total = grid[2] if grid is not None else None
+    if (
+        grid is not None
+        and not explicit_bins
+        and not explicit_range
+        and (x_dim_index, y_dim_index) == (0, 1)
+        and positions_fit_grid(x_positions, y_positions, grid[0], grid[1], uid)
+    ):
+        histogram2d_kwargs["bins"] = [grid[0], grid[1]]
+
+    binned_output: dict = {}
     for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
         binned_channel = compute_binned_image(
             data[channel], x_positions, y_positions, **histogram2d_kwargs
         )
-        binned_output[channel] = binned_channel["img"].tolist()
+        binned_output[channel] = image_rows_are_y(
+            binned_channel["img"], binned_channel["counts"]
+        )
     binned_output["x_limits"] = binned_channel["x"].tolist()
     binned_output["y_limits"] = binned_channel["y"].tolist()
+    binned_output["n_points"] = n_points
+    binned_output["n_total"] = n_total
 
     return binned_output
+
+
+def image_rows_are_y(img, counts) -> list[list[float | None]]:
+    """The binned image as plot-ready rows: one row per y bin, one column per x
+    bin, and ``None`` (JSON ``null``) where no point landed.
+
+    ``numpy.histogram2d`` indexes its result ``[x_bin, y_bin]``, so it is
+    transposed here. An empty bin is reported as ``None`` rather than ``0`` so a
+    plot can tell "no data yet" from a measured zero.
+    """
+    rows = numpy.where(counts > 0, img, numpy.nan).T.astype(object)
+    rows[counts.T == 0] = None
+    return rows.tolist()
 
 
 def compute_binned_image(data, readback_x, readback_y, **kwargs):
     counts, edges_x, edges_y = numpy.histogram2d(readback_x, readback_y, **kwargs)
     weights, _, _ = numpy.histogram2d(readback_x, readback_y, weights=data, **kwargs)
     img = numpy.divide(weights, counts, out=numpy.zeros_like(weights), where=counts > 0)
-    return {"img": img, "x": edges_x, "y": edges_y}
+    return {"img": img, "counts": counts, "x": edges_x, "y": edges_y}
