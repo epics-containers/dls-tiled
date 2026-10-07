@@ -211,7 +211,9 @@ def _bin_edges(centres: numpy.ndarray) -> numpy.ndarray:
     return numpy.concatenate([[first], mids, [last]])
 
 
-MAX_GRID_CELLS = 1_000_000
+# Past this many cells the native-resolution image is too much to send on every
+# poll, so the caller falls back to the coarse default binning.
+MAX_GRID_CELLS = int(os.getenv("DLS_TILED_VISR_MAX_GRID_CELLS", "100000"))
 
 
 @functools.lru_cache(maxsize=32)

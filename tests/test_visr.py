@@ -279,6 +279,18 @@ def test_grid_is_none_when_the_points_do_not_lie_on_a_grid():
     )
 
 
+def test_grid_is_none_when_it_has_more_cells_than_the_cap(monkeypatch):
+    spec = Line("y", 0, 1, 4) * Line("x", 0, 1, 4)
+    visr._grid_from_spec.cache_clear()
+    assert _grid_or_none(spec) is not None
+
+    monkeypatch.setattr(visr, "MAX_GRID_CELLS", 10)
+    visr._grid_from_spec.cache_clear()
+
+    assert _grid_or_none(spec) is None
+    visr._grid_from_spec.cache_clear()
+
+
 def test_grid_with_a_single_position_gets_a_unit_wide_cell():
     x_edges, _, _ = _grid(Line("y", 0, 1, 2) * Line("x", 3, 3, 1))
 
