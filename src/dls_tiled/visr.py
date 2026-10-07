@@ -214,6 +214,9 @@ def _bin_edges(centres: numpy.ndarray) -> numpy.ndarray:
 # Past this many cells the native-resolution image is too much to send on every
 # poll, so the caller falls back to the coarse default binning.
 MAX_GRID_CELLS = int(os.getenv("DLS_TILED_VISR_MAX_GRID_CELLS", "100000"))
+# The ViSR plot needs at least three points on each axis, so a scan narrower than
+# that keeps the previous default binning.
+MIN_CELLS_PER_AXIS = 3
 
 
 @functools.lru_cache(maxsize=32)
@@ -236,6 +239,8 @@ def _grid_from_spec(spec_json: str, motors_json: str):
     n_total = len(by_axis[axes[0]])
     xs = numpy.unique(numpy.round(by_axis[axes[letters.index("x")]], 9))
     ys = numpy.unique(numpy.round(by_axis[axes[letters.index("y")]], 9))
+    if min(len(xs), len(ys)) < MIN_CELLS_PER_AXIS:
+        return None  # a line, or too few cells for the plot's axes
     if len(xs) * len(ys) > min(n_total, MAX_GRID_CELLS):
         return None  # more cells than points: not a grid
     return _bin_edges(xs), _bin_edges(ys), n_total
