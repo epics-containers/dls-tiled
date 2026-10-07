@@ -7,6 +7,7 @@ import enum
 import inspect
 import logging
 import os
+import re
 
 import anyio.to_thread
 import numpy
@@ -83,19 +84,55 @@ def _channel_length(array: H5Dataset | numpy.ndarray | dict) -> int:
     return array.shape[-1]
 
 
+_AXIS_LETTERS = ("x", "y", "z")
+
+
+def _axis_letter(name: object) -> str | None:
+    """Return "x", "y" or "z" if the axis name ends in one (e.g. "sample_stage-x")."""
+    if not isinstance(name, str):
+        return None
+    letter = re.split(r"[-_.]", name.lower())[-1]
+    return letter if letter in _AXIS_LETTERS else None
+
+
+def _xyz_order(axes: list, motors: object) -> list[int]:
+    """Indices that put a spec's axes in x, y, z order.
+
+    A spec lists its axes outermost dimension first, which is not necessarily x
+    first (a raster scan has y as the outer axis). Newer runs name their axes
+    in the spec; older ones recorded an object repr, so for those the run's
+    ``motors`` list, which is in the same order, supplies the names. If the axes
+    cannot be told apart as x, y and z, keep the spec's own order.
+    """
+    names = list(axes)
+    if (
+        any(isinstance(n, str) and n.startswith("<") for n in names)
+        and isinstance(motors, list)
+        and len(motors) == len(names)
+    ):
+        names = list(motors)
+    letters = [_axis_letter(n) for n in names]
+    if None in letters or len(set(letters)) != len(letters):
+        return list(range(len(axes)))
+    return sorted(range(len(axes)), key=lambda i: _AXIS_LETTERS.index(letters[i]))
+
+
 async def get_setpoints(root, uid):
     """Return setpoints from the bluesky start document stored in a node's metadata."""
     adapter = await root.lookup_adapter([uid])
     metadata = adapter.metadata()
     try:
-        spec = Spec.deserialize(metadata["start"]["spec"])
+        start = metadata["start"]
+        spec = Spec.deserialize(start["spec"])
     except KeyError as e:
         raise HTTPException(
             status_code=HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Could not find 'start.spec' in metadata for '{uid}': {e}",
         ) from None
 
-    midpoints = list(stack2dimension(spec.calculate()).midpoints.values())
+    by_axis = stack2dimension(spec.calculate()).midpoints
+    axes = list(by_axis)
+    midpoints = [by_axis[axes[i]] for i in _xyz_order(axes, start.get("motors"))]
     x = midpoints[0]
     y = midpoints[1] if len(midpoints) > 1 else numpy.full(x.shape, numpy.nan)
     z = midpoints[2] if len(midpoints) > 2 else numpy.full(x.shape, numpy.nan)

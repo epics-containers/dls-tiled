@@ -1,10 +1,14 @@
+import asyncio
+from types import SimpleNamespace
+
 import numpy
 import pytest
+from scanspec.specs import Line
 from tiled.catalog import in_memory
 from tiled.client import Context, from_context
 from tiled.server.app import build_app
 
-from dls_tiled.visr import compute_binned_image, visr_router
+from dls_tiled.visr import compute_binned_image, get_setpoints, visr_router
 
 
 @pytest.fixture
@@ -57,3 +61,47 @@ def test_compute_binned_image_empty_bins_are_zero():
     )
 
     assert result["img"].tolist() == [[2.0, 0.0], [0.0, 0.0]]
+
+
+def _setpoints(spec, **start):
+    """Run get_setpoints against a fake root whose run has this start document."""
+    metadata = {"start": {"spec": spec.serialize(), **start}}
+    adapter = SimpleNamespace(metadata=lambda: metadata)
+
+    async def lookup_adapter(path):
+        return adapter
+
+    return asyncio.run(
+        get_setpoints(SimpleNamespace(lookup_adapter=lookup_adapter), "uid")
+    )
+
+
+def test_setpoints_follow_axis_names_not_dimension_order():
+    # Raster scan: y is the outer dimension, x the inner one.
+    spec = Line("sample_stage-y", 0, 1, 2) * Line("sample_stage-x", 0, 10, 3)
+
+    x, y, z = _setpoints(spec)
+
+    assert x.tolist() == [0, 5, 10, 0, 5, 10]
+    assert y.tolist() == [0, 0, 0, 1, 1, 1]
+    assert numpy.isnan(z).all()
+
+
+def test_setpoints_of_runs_with_repr_axes_use_the_motors_list():
+    spec = Line("<Motor object at 0x1>", 0, 1, 2) * Line(
+        "<Motor object at 0x2>", 0, 10, 3
+    )
+
+    x, y, _ = _setpoints(spec, motors=["sample_stage-y", "sample_stage-x"])
+
+    assert x.tolist() == [0, 5, 10, 0, 5, 10]
+    assert y.tolist() == [0, 0, 0, 1, 1, 1]
+
+
+def test_setpoints_keep_dimension_order_when_axes_are_not_x_y_z():
+    spec = Line("theta", 0, 1, 2) * Line("energy", 0, 10, 3)
+
+    x, y, _ = _setpoints(spec)
+
+    assert x.tolist() == [0, 0, 0, 1, 1, 1]
+    assert y.tolist() == [0, 5, 10, 0, 5, 10]
