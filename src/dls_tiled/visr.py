@@ -260,6 +260,41 @@ def _grid_from_spec(spec_json: str, motors_json: str):
     return _bin_edges(xs), _bin_edges(ys), n_total
 
 
+# Share of the recorded positions that must lie inside the spec's grid for the
+# grid to be used for binning them.
+MIN_POSITIONS_ON_GRID = 0.9
+
+
+def positions_fit_grid(x, y, x_edges, y_edges, uid="") -> bool:
+    """Whether the recorded positions lie on the spec's grid.
+
+    The grid is in the spec's coordinates. If the recorded positions are in
+    another frame (fly scans currently record positions offset from their
+    setpoints), binning them onto that grid would leave it empty, so the
+    caller keeps the previous binning instead.
+    """
+    x, y = numpy.asarray(x, dtype=float), numpy.asarray(y, dtype=float)
+    if x.size == 0:
+        return True  # nothing received yet: the grid is all there is to show
+    inside = (
+        (x >= x_edges[0]) & (x <= x_edges[-1]) & (y >= y_edges[0]) & (y <= y_edges[-1])
+    )
+    share = float(inside.mean())
+    if share < MIN_POSITIONS_ON_GRID:
+        logger.info(
+            "Recorded positions for '%s' lie outside the spec's grid "
+            "(%.0f%% inside x %s..%s, y %s..%s); keeping the default binning",
+            uid,
+            100 * share,
+            x_edges[0],
+            x_edges[-1],
+            y_edges[0],
+            y_edges[-1],
+        )
+        return False
+    return True
+
+
 async def get_scan_grid(root, uid):
     """The run's setpoint grid ``(x_edges, y_edges, n_total)``, or None."""
     try:
@@ -708,6 +743,7 @@ async def _binned_output(
         and not explicit_bins
         and not explicit_range
         and (x_dim_index, y_dim_index) == (0, 1)
+        and positions_fit_grid(x_positions, y_positions, grid[0], grid[1], uid)
     ):
         histogram2d_kwargs["bins"] = [grid[0], grid[1]]
 

@@ -519,3 +519,31 @@ def test_grid_of_runs_with_named_reprs_needs_no_motors_list():
     assert x_edges.tolist() == [-2.5, 2.5, 7.5, 12.5]
     assert y_edges.tolist() == [-0.5, 0.5, 1.5, 2.5]
     assert n_total == 9
+
+
+def test_binned_keeps_the_default_binning_when_positions_are_off_the_grid(client):
+    # fly scans currently record positions offset from their setpoints
+    spec = Line("Y", 0, 2, 3) * Line("X", 0, 2, 3)
+    metadata = {"start": {"spec": spec.serialize()}}
+    primary = client.create_container("offset", metadata=metadata).create_container(
+        "primary"
+    )
+    primary.write_array(numpy.array([0.0, 1.0, 2.0] * 3) + 1.0, key="X")
+    primary.write_array(numpy.repeat([0.0, 1.0, 2.0], 3) + 10.4, key="Y")
+    for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
+        primary.write_array(numpy.arange(9.0), key=channel)
+
+    body = client.context.http_client.get("/api/v1/binned/offset").json()
+
+    assert len(body["RedTotal"]) == 10 and len(body["RedTotal"][0]) == 10
+    assert body["x_limits"][0] == 1.0  # the default binning spans the data
+    assert body["n_total"] == 9  # still known from the spec
+
+
+def test_positions_fit_grid():
+    edges = numpy.array([-0.5, 0.5, 1.5, 2.5])
+    on = numpy.array([0.0, 1.0, 2.0])
+
+    assert visr.positions_fit_grid(on, on, edges, edges)
+    assert not visr.positions_fit_grid(on + 10, on, edges, edges)
+    assert visr.positions_fit_grid(numpy.array([]), numpy.array([]), edges, edges)
