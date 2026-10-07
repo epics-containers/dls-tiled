@@ -4,7 +4,9 @@ Enable it in the tiled config with ``routers: [dls_tiled.visr:visr_router]``.
 """
 
 import enum
+import functools
 import inspect
+import json
 import logging
 import os
 import re
@@ -119,14 +121,12 @@ def _axis_letter(name: object) -> str | None:
     return letter if letter in _AXIS_LETTERS else None
 
 
-def _xyz_order(axes: list, motors: object) -> list[int]:
-    """Indices that put a spec's axes in x, y, z order.
+def _axis_letters(axes: list, motors: object) -> list[str | None]:
+    """The x/y/z letter of each spec axis, or None where it can't be told.
 
-    A spec lists its axes outermost dimension first, which is not necessarily x
-    first (a raster scan has y as the outer axis). Newer runs name their axes
-    in the spec; older ones recorded an object repr, so for those the run's
-    ``motors`` list, which is in the same order, supplies the names. If the axes
-    cannot be told apart as x, y and z, keep the spec's own order.
+    Newer runs name their axes in the spec; older ones recorded an object repr,
+    so for those the run's ``motors`` list, which is in the same order as the
+    spec's axes, supplies the names.
     """
     names = list(axes)
     if (
@@ -135,10 +135,71 @@ def _xyz_order(axes: list, motors: object) -> list[int]:
         and len(motors) == len(names)
     ):
         names = list(motors)
-    letters = [_axis_letter(n) for n in names]
+    return [_axis_letter(n) for n in names]
+
+
+def _xyz_order(axes: list, motors: object) -> list[int]:
+    """Indices that put a spec's axes in x, y, z order.
+
+    A spec lists its axes outermost dimension first, which is not necessarily x
+    first (a raster scan has y as the outer axis). If the axes cannot be told
+    apart as x, y and z, keep the spec's own order.
+    """
+    letters = _axis_letters(axes, motors)
     if None in letters or len(set(letters)) != len(letters):
         return list(range(len(axes)))
     return sorted(range(len(axes)), key=lambda i: _AXIS_LETTERS.index(letters[i]))
+
+
+def _bin_edges(centres: numpy.ndarray) -> numpy.ndarray:
+    """Edges halfway between consecutive centres, extended half a step at each end."""
+    if len(centres) == 1:
+        return numpy.array([centres[0] - 0.5, centres[0] + 0.5])
+    mids = (centres[:-1] + centres[1:]) / 2
+    first = centres[0] - (centres[1] - centres[0]) / 2
+    last = centres[-1] + (centres[-1] - centres[-2]) / 2
+    return numpy.concatenate([[first], mids, [last]])
+
+
+MAX_GRID_CELLS = 1_000_000
+
+
+@functools.lru_cache(maxsize=32)
+def _grid_from_spec(spec_json: str, motors_json: str):
+    """Bin edges for x and y and the point count of the scan the spec describes.
+
+    The grid is the set of distinct setpoint positions on each axis, so every
+    setpoint falls in its own cell and the cells' edges lie halfway between
+    neighbours. Returns None when the spec has no x and y axes that can be
+    identified, or doesn't lay points out on a grid (a spiral, say), where the
+    caller falls back to binning the positions as they come. Cached: the spec
+    of a run never changes, and this is asked for on every poll.
+    """
+    spec = Spec.deserialize(json.loads(spec_json))
+    by_axis = stack2dimension(spec.calculate()).midpoints
+    axes = list(by_axis)
+    letters = _axis_letters(axes, json.loads(motors_json))
+    if "x" not in letters or "y" not in letters or len(set(letters)) != len(letters):
+        return None
+    n_total = len(by_axis[axes[0]])
+    xs = numpy.unique(numpy.round(by_axis[axes[letters.index("x")]], 9))
+    ys = numpy.unique(numpy.round(by_axis[axes[letters.index("y")]], 9))
+    if len(xs) * len(ys) > min(n_total, MAX_GRID_CELLS):
+        return None  # more cells than points: not a grid
+    return _bin_edges(xs), _bin_edges(ys), n_total
+
+
+async def get_scan_grid(root, uid):
+    """The run's setpoint grid ``(x_edges, y_edges, n_total)``, or None."""
+    try:
+        adapter = await root.lookup_adapter([uid])
+        start = adapter.metadata()["start"]
+        return _grid_from_spec(
+            json.dumps(start["spec"]), json.dumps(start.get("motors"))
+        )
+    except Exception as e:
+        logger.debug("No usable scan grid for '%s': %s", uid, e)
+        return None
 
 
 async def get_setpoints(root, uid):
@@ -317,7 +378,12 @@ async def binned(  # type: ignore
     Returns ``RedTotal``/``GreenTotal``/``BlueTotal`` as matrices with one row per
     y bin and one column per x bin (the layout image plots expect), ``null`` for
     bins no point fell into, ``x_limits``/``y_limits`` as the bin edges (one more
-    than the columns/rows), and ``n_points``, the number of scan points used.
+    than the columns/rows), ``n_points``, the number of scan points used, and
+    ``n_total``, the number the scan will have (``null`` if the run has no spec).
+
+    Unless ``width``/``height`` or a full range are given, bins follow the scan's
+    setpoint grid when its spec describes one: one cell per setpoint, a range
+    fixed from the first poll.
 
     Args:
         x_dim_index: Index into the position array to use as the x axis (default 0).
@@ -507,11 +573,27 @@ async def binned(  # type: ignore
     y_positions = readbacks[y_dim_index, :]
 
     # bundle the kwargs
-    histogram2d_kwargs = {}
-    if all(opt is not None for opt in (width, height)):
+    histogram2d_kwargs: dict = {}
+    explicit_bins = all(opt is not None for opt in (width, height))
+    explicit_range = all(opt is not None for opt in (xmin, xmax, ymin, ymax))
+    if explicit_bins:
         histogram2d_kwargs["bins"] = (width, height)
-    if all(opt is not None for opt in (xmin, xmax, ymin, ymax)):
+    if explicit_range:
         histogram2d_kwargs["range"] = ((xmin, xmax), (ymin, ymax))
+
+    # Unless the caller chose the binning, use the scan's own setpoint grid: one
+    # cell per setpoint and a range fixed by the spec from the first poll, rather
+    # than a fixed 10x10 over whatever extent the points received so far happen
+    # to cover (which rescales the whole image as the scan fills in).
+    grid = await get_scan_grid(root, uid)
+    n_total = grid[2] if grid is not None else None
+    if (
+        grid is not None
+        and not explicit_bins
+        and not explicit_range
+        and (x_dim_index, y_dim_index) == (0, 1)
+    ):
+        histogram2d_kwargs["bins"] = [grid[0], grid[1]]
 
     binned_output: dict = {}
     for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
@@ -524,6 +606,7 @@ async def binned(  # type: ignore
     binned_output["x_limits"] = binned_channel["x"].tolist()
     binned_output["y_limits"] = binned_channel["y"].tolist()
     binned_output["n_points"] = n_points
+    binned_output["n_total"] = n_total
 
     return binned_output
 

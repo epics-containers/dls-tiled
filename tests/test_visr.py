@@ -1,10 +1,11 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import numpy
 import pytest
 from fastapi import HTTPException
-from scanspec.specs import Line
+from scanspec.specs import Line, Spiral
 from tiled.adapters.utils import DataNotReadyError
 from tiled.catalog import in_memory
 from tiled.client import Context, from_context
@@ -228,3 +229,111 @@ def test_binned_keeps_a_503_instead_of_turning_it_into_422(client, monkeypatch):
 
     assert response.status_code == 503
     assert response.headers["retry-after"] == "1"
+
+
+# --- the scan's own grid ------------------------------------------------------------
+
+
+def _grid_or_none(spec, motors=None):
+    return visr._grid_from_spec(json.dumps(spec.serialize()), json.dumps(motors))
+
+
+def _grid(spec, motors=None):
+    grid = _grid_or_none(spec, motors)
+    assert grid is not None
+    return grid
+
+
+def test_grid_edges_sit_halfway_between_setpoints():
+    spec = Line("sample_stage-y", 0, 1, 2) * ~Line("sample_stage-x", 0, 10, 3)
+
+    x_edges, y_edges, n_total = _grid(spec)
+
+    assert x_edges.tolist() == [-2.5, 2.5, 7.5, 12.5]
+    assert y_edges.tolist() == [-0.5, 0.5, 1.5]
+    assert n_total == 6
+
+
+def test_grid_of_runs_with_repr_axes_uses_the_motors_list():
+    spec = Line("<Motor object at 0x1>", 0, 1, 2) * Line(
+        "<Motor object at 0x2>", 0, 10, 3
+    )
+
+    x_edges, y_edges, _ = _grid(spec, ["sample_stage-y", "sample_stage-x"])
+
+    assert len(x_edges) == 4 and len(y_edges) == 3
+
+
+def test_grid_is_none_when_the_axes_are_not_x_and_y():
+    assert _grid_or_none(Line("theta", 0, 1, 2) * Line("energy", 0, 10, 3)) is None
+
+
+def test_grid_is_none_when_the_points_do_not_lie_on_a_grid():
+    assert (
+        _grid_or_none(
+            Spiral(
+                x_axis="x", x_centre=0, x_diameter=5, x_step=1, y_axis="y", y_centre=0
+            )
+        )
+        is None
+    )
+
+
+def test_grid_with_a_single_position_gets_a_unit_wide_cell():
+    x_edges, _, _ = _grid(Line("y", 0, 1, 2) * Line("x", 3, 3, 1))
+
+    assert x_edges.tolist() == [2.5, 3.5]
+
+
+def write_grid_scan(client, uid, n_points):
+    """The first `n_points` of a 2 (x) by 3 (y) raster; its spec is in the start doc."""
+    spec = Line("Y", 0, 2, 3) * Line("X", 0, 1, 2)
+    metadata = {"start": {"spec": spec.serialize(), "motors": ["Y", "X"]}}
+    primary = client.create_container(uid, metadata=metadata).create_container(
+        "primary"
+    )
+    x = numpy.array([0.0, 1.0] * 3)[:n_points]
+    y = numpy.repeat([0.0, 1.0, 2.0], 2)[:n_points]
+    primary.write_array(x, key="X")
+    primary.write_array(y, key="Y")
+    for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
+        primary.write_array(numpy.arange(6.0)[:n_points], key=channel)
+
+
+def test_binned_uses_the_scans_grid_without_being_asked(client):
+    write_grid_scan(client, "grid", 6)
+
+    body = client.context.http_client.get("/api/v1/binned/grid").json()
+
+    assert body["RedTotal"] == [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]
+    assert body["x_limits"] == [-0.5, 0.5, 1.5]
+    assert body["y_limits"] == [-0.5, 0.5, 1.5, 2.5]
+    assert (body["n_points"], body["n_total"]) == (6, 6)
+
+
+def test_binned_grid_is_the_same_shape_from_the_first_points_of_a_scan(client):
+    write_grid_scan(client, "partial", 4)  # the last row hasn't been measured yet
+
+    body = client.context.http_client.get("/api/v1/binned/partial").json()
+
+    assert body["RedTotal"] == [[0.0, 1.0], [2.0, 3.0], [None, None]]
+    assert body["y_limits"] == [-0.5, 0.5, 1.5, 2.5]
+    assert (body["n_points"], body["n_total"]) == (4, 6)
+
+
+def test_binned_explicit_width_and_height_override_the_grid(client):
+    write_grid_scan(client, "chosen", 6)
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/chosen", params={"width": 1, "height": 1}
+    ).json()
+
+    assert body["RedTotal"] == [[2.5]]
+
+
+def test_binned_without_a_spec_still_reports_no_total(client):
+    write_step_scan(client)
+
+    body = client.context.http_client.get("/api/v1/binned/scan").json()
+
+    assert body["n_total"] is None
